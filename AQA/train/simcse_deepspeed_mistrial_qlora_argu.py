@@ -333,6 +333,7 @@ class EmbedCollator(DataCollatorWithPadding):
 
         return {"query": q_collated, "passage": d_collated}
 
+### 解码器定义
 class MistralModel(MistralPreTrainedModel):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MistralDecoderLayer`]
@@ -512,53 +513,33 @@ class MistralModel(MistralPreTrainedModel):
             attentions=all_self_attns,
         )
 
-# from transformers import MistralModel
-# class IgnoreLabelsWrapper(MistralModel):
-#     def __init__(self, base_model: nn.Module):
-#         super().__init__(base_model.config)
-#         self.base_model = base_model
-#         self.config = base_model.config
-#
-#     def forward(
-#         self,
-#         input_ids=None,
-#         attention_mask=None,
-#         inputs_embeds=None,
-#         labels=None,
-#         output_attentions=None,
-#         output_hidden_states=None,
-#         return_dict=None,
-#         **kwargs,
-#     ):
-#         # Remove labels, which are unused by the base model
-#         return self.base_model(
-#             input_ids=input_ids,
-#             attention_mask=attention_mask,
-#             inputs_embeds=inputs_embeds,
-#             output_attentions=output_attentions,
-#             output_hidden_states=output_hidden_states,
-#             return_dict=return_dict,
-#             **kwargs,
-#         )
+
+
+
+### 双编码结构，处理信息检索或问答任务，通常在给定查询和相关文本（如段落或句子）时，计算二者之间的相似度。
 class BiEncoderModel(nn.Module):
     def __init__(self,
                  args,
                  normlized: bool = False,
-                 negatives_cross_device: bool = False,
-                 temperature: float = 1.0,
-                 use_inbatch_neg: bool = True,
-                 sentence_pooling_method: str = "last"
+                 negatives_cross_device: bool = False, #是否跨设备处理负样本。
+                 temperature: float = 1.0, #温度参数，通常用于控制softmax的平滑程度。
+                 use_inbatch_neg: bool = True, #是否使用批内负样本。
+                 sentence_pooling_method: str = "last" #指定句子池化的方法（如使用最后一个token、CLS token或均值）。
+                 negatives_cross_device: 
                  ):
         super().__init__()
-        bnb_config = BitsAndBytesConfig(
+
+        #设置模型在4位量化下运行，以减少内存占用。
+        bnb_config = BitsAndBytesConfig( 
             load_in_4bit=True,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16
         )
         model = MistralModel.from_pretrained(args.model_name_or_path, quantization_config=bnb_config)
-        # model = IgnoreLabelsWrapper(model)
-        config = LoraConfig(
+
+        # 使用LoRA（Low-Rank Adaptation）进行微调配置。
+        loraConfig = LoraConfig(
             r=64,
             lora_alpha=128,
             target_modules=[
@@ -574,7 +555,7 @@ class BiEncoderModel(nn.Module):
             lora_dropout=0.05,  # Conventional
             task_type="CAUSAL_LM",
         )
-        self.model = get_peft_model(model, config)
+        self.model = get_peft_model(model, loraConfig)
         self.model.print_trainable_parameters()
 
         # if args.gradient_checkpointing and args.zero_stage != 3:
@@ -619,7 +600,7 @@ class BiEncoderModel(nn.Module):
             batch_size = last_hidden_states.shape[0]
             return last_hidden_states[torch.arange(batch_size, device=last_hidden_states.device), sequence_lengths]
 
-    def sentence_embedding(self, hidden_state, mask):
+    def sentence_embedding(self, hidden_state, mask): # 根据需要选择不同的句子池化方法。
         if self.sentence_pooling_method == 'mean':
             s = torch.sum(hidden_state * mask.unsqueeze(-1).float(), dim=1)
             d = mask.sum(axis=1, keepdim=True).float()
@@ -645,6 +626,10 @@ class BiEncoderModel(nn.Module):
             return torch.matmul(q_reps, p_reps.transpose(0, 1))
         return torch.matmul(q_reps, p_reps.transpose(-2, -1))
 
+
+    # 对查询和段落进行编码，得到其嵌入表示。
+    # 在训练模式下，处理批内负样本，计算查询和段落之间的相似度分数。
+    # 计算损失并返回损失、分数以及查询和段落的嵌入表示。
     def forward(self, query, passage):
         q_reps = self.encode(query)
         p_reps = self.encode(passage)
@@ -682,10 +667,11 @@ class BiEncoderModel(nn.Module):
             p_reps=p_reps,
         )
 
+    
     def compute_loss(self, scores, target):
         return self.cross_entropy(scores, target)
 
-    def _dist_gather_tensor(self, t: Optional[torch.Tensor]):
+    def _dist_gather_tensor(self, t: Optional[torch.Tensor]): # 在分布式环境中收集所有设备上的张量，以便进行跨设备计算。
         if t is None:
             return None
         t = t.contiguous()
@@ -706,6 +692,7 @@ def main():
     print(torch.cuda.is_available())
     print(torch.cuda.device_count())
 
+    # local_rank 参数决定使用哪个GPU。如果 local_rank 为 -1，则使用第一个可用的GPU
     if args.local_rank == -1:
         device = torch.device("cuda")
     else:
@@ -715,7 +702,10 @@ def main():
         # torch.distributed.init_process_group(backend='nccl')
         deepspeed.init_distributed()
 
+    3 当前进程的全局排名
     args.global_rank = torch.distributed.get_rank()
+
+    # DeepSpeed配置: 获取训练配置，设置批次大小和其他训练参数。
     ds_config = get_train_ds_config(offload=args.offload,
                                     stage=args.zero_stage,
                                     enable_tensorboard=args.enable_tensorboard,
@@ -732,9 +722,12 @@ def main():
 
     torch.distributed.barrier()
 
+
+    # 分词器和模型加载
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
     model = BiEncoderModel(args, normlized=True, negatives_cross_device=True, temperature=0.02)
 
+    # 数据集和数据加载器
     train_dataset = TrainDatasetForEmbedding(args, tokenizer)
 
     # DataLoaders creation:
