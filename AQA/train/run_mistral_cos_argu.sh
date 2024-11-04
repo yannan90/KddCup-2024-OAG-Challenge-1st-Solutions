@@ -17,8 +17,8 @@ OUTPUT=${PATH_PRE}/competiitons/kdd2024/task3/model_save/${MODEL_USE}_qlora_reru
 #模型地址
 MODEL_PATH=../model_save/SFR-Embedding-Mistral
 mkdir -p ${OUTPUT}
-echo ${ZERO_STAGE}
-echo ${OUTPUT}
+echo ${ZERO_STAGE} # 打印当前阶段，用于调试。
+echo ${OUTPUT} #打印输出路径，用于调试。
 
 MASTER_PORT=$(shuf -n 1 -i 10000-65535)
 echo ${MASTER_PORT}
